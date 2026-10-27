@@ -17,7 +17,7 @@ def invoke(port, name, arguments):
         # Large files and older clients' raw screenshots use many cooperative
         # native RPC chunks, particularly while physical hardware is busy.
         # Keep the longer wait specific and bounded; never retry an import.
-        connection.settimeout(600 if name in {"imac_import_file", "imac_screenshot"} else 120)
+        connection.settimeout(600 if name in {"imac_import_file", "imac_import_archive", "imac_screenshot"} else 120)
         stream = connection.makefile("rwb")
         greeting = stream.readline(4096)
         if not greeting.startswith(b"agentd admin console"):

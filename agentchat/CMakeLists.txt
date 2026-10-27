@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.13)
 # AgentChat — Mac OS 9 chat terminal (Retro68 build)
 add_application(AgentChat CREATOR "AGCH"
     agentchat.c
+    RelayDiscovery.c
     RemoteMac.c
     CatalogInfo.c
     IdleMetrics.c

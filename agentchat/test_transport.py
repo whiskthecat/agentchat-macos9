@@ -17,16 +17,19 @@ SOURCE = Path(__file__).resolve().parent
 
 def function(source, name):
     """Copy a complete production function; braces in these functions are balanced."""
-    match = re.search(r"^(?:static )?(?:void|Boolean|long|OSErr) " + re.escape(name) +
+    match = re.search(r"^(?:static )?(?:void|Boolean|long|OSErr|UInt32|char \*)\s*" + re.escape(name) +
                       r"\([^;]*?\)\s*\{", source, re.M)
     if not match:
         raise ValueError("Missing production function " + name)
-    end = match.end()
     depth = 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[match.start():end] + "\n"
+    # Braces inside JSON strings and comments do not delimit C functions.
+    tokens = re.finditer(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*.*?\*/|//[^\n]*|[{}]', source[match.end():], re.S)
+    for token in tokens:
+        depth += (token.group() == "{") - (token.group() == "}")
+        if not depth:
+            return source[match.start():match.end() + token.end()] + "\n"
+    raise ValueError("Unterminated production function " + name)
+
 
 
 PREFIX = r'''
@@ -44,6 +47,9 @@ PREFIX = r'''
 #define noErr 0
 #define paramErr -50
 #define memFullErr -108
+#define dskFulErr -34
+#define MAX_STREAM_FILE (64L * 1024L * 1024L)
+#define AGENTCHAT_BINARY_BURST_TICKS 2u
 #define fnfErr -43
 #define dupFNErr -48
 #define smSystemScript 0
@@ -71,7 +77,24 @@ static char gJSON[JSON_CAP], gWire[JSON_CAP * 2];
 static long gJN, gReplyBytes;
 static Boolean gHandling, gOverflow;
 static const char k64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static struct { Boolean active; unsigned long used; char token[48]; } gWrite;
+typedef char *Ptr;
+static struct { Boolean active, stream, binary; unsigned long used;
+    char token[48]; long received, size, fd; UInt32 writtenCRC; } gWrite;
+static struct { Ptr buffer; long remaining; Boolean failed; char nonce[41]; } gBinary;
+static Ptr NewPtr(long count) { return malloc((size_t)count); }
+static void DisposePtr(Ptr ptr) { free(ptr); }
+static char forkBody[1000000]; static long forkBytes;
+static int forkError, forkShort, forkTicks;
+static UInt32 fakeTicks = 1;
+static OSErr FSWrite(long fd, long *count, const char *bytes) {
+    (void)fd;
+    if (forkError) return -34;
+    if (forkShort && *count) --*count;
+    assert(*count >= 0 && forkBytes + *count <= (long)sizeof(forkBody));
+    memcpy(forkBody + forkBytes, bytes, (size_t)*count); forkBytes += *count;
+    fakeTicks += forkTicks;
+    return 0;
+}
 static void *gScreen;
 static unsigned long gScreenUsed, gLastOperation;
 static void IdleMetricsSend(void) {}
@@ -79,6 +102,8 @@ static void IdleMetricsReceive(void) {}
 static char gAccum[65536], gQ[65536], gRecv[4096];
 static long gAccumLen, gQLen, gQPos, gRecvLen, gRecvPos, gEP;
 static Boolean gConnected, gReceiving, gBusy, gDirty, gNavDirty, gHistoryLoading, gDraftCached;
+static Boolean gUsingDiscovered;
+static void RelayDiscoveryCancel(void) {}
 static int gConnPhase;
 static Boolean gRelayHeartbeat;
 static Boolean gRelayGreeted;
@@ -91,7 +116,6 @@ static char lastReply[65536];
 static long lastReplyBytes;
 static void poll_recv(void);
 void RemoteMacEvent(const char *kind, const char *detail) { (void)kind; (void)detail; }
-static UInt32 fakeTicks = 1;
 static UInt32 TickCount(void) { return fakeTicks; }
 static void set_status(const char *msg) { snprintf(lastStatus, sizeof(lastStatus), "%s", msg); }
 static void flush_cur(void) {}
@@ -101,7 +125,11 @@ static void ChatImagesDisconnect(void) {}
 static void OTRemoveNotifier(long endpoint) { (void)endpoint; }
 static void OTSndOrderlyDisconnect(long endpoint) { (void)endpoint; }
 static void OTCloseProvider(long endpoint) { (void)endpoint; }
-static void cancel_write(void) { cleanupCalls++; gWrite.active = FALSE; }
+static void cancel_write(void) {
+    cleanupCalls++; gWrite.active = FALSE;
+    if (gBinary.buffer) DisposePtr(gBinary.buffer);
+    memset(&gBinary, 0, sizeof(gBinary));
+}
 static void release_screen(void) { cleanupCalls++; gScreen = NULL; }
 static long OTSnd(long endpoint, const char *data, long bytes, int flags) {
     long count = bytes;
@@ -146,7 +174,7 @@ static OSErr HardwareInfoJSON(char *out, long capacity) {
  * opaque here without pretending to implement their layout or behavior. */
 #define FAKE(name) static OSErr name() { return operation(); }
 FAKE(volumes) FAKE(directory) FAKE(set_file_info) FAKE(open_document)
-FAKE(read_file) FAKE(begin_write) FAKE(write_chunk) FAKE(commit_write)
+FAKE(restore_file_info) FAKE(read_file) FAKE(begin_write) FAKE(write_chunk) FAKE(commit_write)
 FAKE(system_configuration) FAKE(system_items) FAKE(system_probe)
 FAKE(HardwareRegistryProbeJSON) FAKE(IdleMetricsJSON)
 FAKE(state) FAKE(events) FAKE(processes) FAKE(process_info)
@@ -194,6 +222,7 @@ static void reset(void) {
     sendFailure = receiveFailure = recvCalls = dispatchCalls = operationCalls = 0;
     responseBytes = sendCalls = rejectCalls = recursiveSend = probeOperation = 0;
     lastReplyBytes = 0; lastStatus[0] = 0;
+    forkBytes = forkError = forkShort = forkTicks = 0;
     RemoteMacInit(sendReply, NULL, action);
 }
 static void receiveCommand(const char *nonce, const char *operationName) {
@@ -341,6 +370,84 @@ static void manyRPCsWithPartialFlow(void) {
     }
     assert(offset == sentBytes && RemoteMacCanReceive() && gRecvPos == gRecvLen);
 }
+
+static void binaryFrame(long bytes, long slice) {
+    long i, header;
+    reset(); sendAllowance = 100000; receiveSlice = slice;
+    gWrite.active = gWrite.stream = gWrite.binary = TRUE;
+    gWrite.received = 0; gWrite.size = bytes; gWrite.used = fakeTicks;
+    gWrite.writtenCRC = 0xFFFFFFFFu; strcpy(gWrite.token, "AC~123456781234");
+    header = sprintf(incoming, "B:raw-fork-v1\t%s\t%ld\t0123456789abcdef0123456789abcdef\n", gWrite.token, bytes);
+    for (i = 0; i < bytes; i++) incoming[header + i] = (char)(i % 256);
+    /* The body includes arbitrary newlines/NULs and control-shaped text. */
+    if (bytes > 80) memcpy(incoming + header, "C:QUIT\nP:never dispatch\nH:alive\n\0\r", 32);
+    incomingBytes = header + bytes;
+}
+static void binaryExact(void) {
+    int i; const long slices[] = {1, 37, 4096, 65536};
+    for (i = 0; i < 4; i++) {
+        long bodyOffset;
+        binaryFrame(200123, slices[i]); bodyOffset = incomingBytes - 200123;
+        incomingBytes += sprintf(incoming + incomingBytes, "H:alive\n");
+        receiveCommand("bbbbbbbb", "hardware");
+        poll_recv();
+        assert(gConnected && !RemoteMacBinaryRemaining() && !gBinary.buffer);
+        assert(forkBytes == 200123 && !memcmp(forkBody, incoming + bodyOffset, (size_t)forkBytes));
+        assert(gWrite.received == forkBytes && dispatchCalls == 2 && operationCalls == 1);
+        assert(!memcmp(sent, "E:0123456789abcdef0123456789abcdef\t0\t", 37));
+        assert(gWrite.writtenCRC == crc_update(0xFFFFFFFFu, (const unsigned char *)forkBody, forkBytes));
+    }
+    /* Standard IEEE CRC-32 check vector, across multiple updates. */
+    assert((crc_update(crc_update(0xFFFFFFFFu, (const unsigned char *)"1234", 4),
+                       (const unsigned char *)"56789", 5) ^ 0xFFFFFFFFu) == 0xcbf43926u);
+}
+static void binaryBackpressureAndYield(void) {
+    long written;
+    binaryFrame(10000, 4096); rejectCalls = 2;
+    receiveCommand("bbbbbbbb", "hardware"); poll_recv();
+    assert(forkBytes == 10000 && !RemoteMacCanReceive() && operationCalls == 0);
+    written = forkBytes; poll_recv();
+    assert(forkBytes == written && operationCalls == 0 && !RemoteMacCanReceive());
+    poll_recv(); assert(forkBytes == written && operationCalls == 1 && RemoteMacCanReceive());
+    binaryFrame(300000, 65536); forkTicks = 1;
+    poll_recv();
+    assert(gConnected && RemoteMacBinaryRemaining() > 0 && forkBytes <= 4096 + 65536);
+    assert(fakeTicks == 3 && !gReceiving);
+    while (RemoteMacBinaryRemaining()) poll_recv();
+    assert(gConnected && forkBytes == 300000);
+}
+
+static void binaryTruncated(void) {
+    binaryFrame(10000, 37); incomingBytes -= 500;
+    poll_recv(); assert(gConnected && RemoteMacBinaryRemaining() == 500 && gWrite.active);
+    fakeTicks += 900; poll_recv();
+    assert(!gConnected && !gWrite.active && !gBinary.buffer && !dispatchCalls);
+    /* Reconnect starts in line mode; the old token/body is never resumed. */
+    incomingBytes = incomingPos = 0; gConnected = TRUE; gEP = 2;
+    receiveCommand("bbbbbbbb", "hardware"); poll_recv(); assert(operationCalls == 1);
+    binaryFrame(10000, 4096); incomingBytes -= 2000; poll_recv();
+    receiveFailure = -123; poll_recv();
+    assert(!gConnected && !gWrite.active && !gBinary.buffer && !dispatchCalls);
+}
+static void binaryInvalid(void) {
+    int kind;
+    for (kind = 0; kind < 7; kind++) {
+        binaryFrame(10000, 4096);
+        if (kind == 0) gWrite.size++;
+        if (kind == 1) gWrite.binary = FALSE;
+        if (kind == 2) gWrite.stream = FALSE;
+        if (kind == 3) gWrite.token[3] = 'F';
+        if (kind == 4) gWrite.received = 1;
+        if (kind == 5) incoming[60] = 'z'; /* malformed nonce */
+        if (kind == 6) *strchr(incoming, '\n') = '\r'; /* LF framing only */
+        poll_recv(); assert(!gConnected && !gWrite.active && !forkBytes && !dispatchCalls);
+    }
+    binaryFrame(10000, 4096); forkShort = 1; poll_recv();
+    assert(!gConnected && !gWrite.active && !dispatchCalls);
+    binaryFrame(10000, 4096); forkError = 1; poll_recv();
+    assert(!gConnected && !gWrite.active && !dispatchCalls);
+}
+
 static void relayWatchdog(void) {
     reset(); fakeTicks = 100000; poll_recv(); assert(gConnected); /* legacy */
     gRelayHeartbeat = TRUE; gRelayLastReceive = fakeTicks;
@@ -372,6 +479,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "maximum")) maximumResponse();
     else if (!strcmp(argv[1], "many")) manyRPCsWithPartialFlow();
     else if (!strcmp(argv[1], "watchdog")) relayWatchdog();
+    else if (!strcmp(argv[1], "binary")) binaryExact();
+    else if (!strcmp(argv[1], "truncated")) binaryTruncated();
+    else if (!strcmp(argv[1], "invalid")) binaryInvalid();
+    else if (!strcmp(argv[1], "binary-pressure")) binaryBackpressureAndYield();
     else abort();
     puts("passed"); return 0;
 }
@@ -394,7 +505,7 @@ class TransportTests(unittest.TestCase):
         c = PREFIX
         c += "\n".join(function(mac, name) for name in ["add", "number", "encode", "decode", "integer"])
         c += "\n".join(function(app, name) for name in ["q_flush", "q_put", "q_upload_space", "send_line", "close_conn"])
-        c += "\n".join(function(mac, name) for name in ["RemoteMacInit", "RemoteMacSetApplicationIdle", "RemoteMacReset", "RemoteMacCanReceive", "RemoteMacPendingReplyBytes", "RemoteMacTick", "RemoteMacHandle"])
+        c += "\n".join(function(mac, name) for name in ["RemoteMacInit", "RemoteMacSetApplicationIdle", "RemoteMacReset", "RemoteMacCanReceive", "RemoteMacPendingReplyBytes", "RemoteMacTick", "RemoteMacHandle", "crc_update", "RemoteMacBinaryBegin", "RemoteMacBinaryRemaining", "RemoteMacBinaryBuffer", "RemoteMacBinaryFailed", "RemoteMacBinaryReceive"])
         c += "static void handle_line(char *line);\n" + function(app, "poll_recv") + SUFFIX
         (temp / "transport.c").write_text(c)
         cls.binary = temp / "transport"
@@ -415,6 +526,18 @@ class TransportTests(unittest.TestCase):
                                 text=True, timeout=5, env=dict(os.environ, AGENT_TEST_MODE="1"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "passed")
+
+    def test_binary_framing_every_byte_and_following_heartbeat_reply(self):
+        self.scenario("binary")
+
+    def test_binary_completed_reply_backpressure_and_bounded_yield(self):
+        self.scenario("binary-pressure")
+
+    def test_binary_truncation_idle_timeout_disconnect_and_no_resume(self):
+        self.scenario("truncated")
+
+    def test_binary_wrong_length_token_capability_nonce_disk_full_and_short_write(self):
+        self.scenario("invalid")
 
     def test_sent_prefix_capacity_and_short_writes(self):
         self.scenario("prefix")

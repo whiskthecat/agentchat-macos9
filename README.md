@@ -46,17 +46,21 @@ It was developed on, and runs on, a 450 MHz iMac G3 with Mac OS 9.2.1.
    docker compose up -d
    ```
 
-   That's all it needs. It listens for the Mac on port 8765 and comes with
-   [OpenCode](https://opencode.ai)'s free models, which need no account. New
+   It comes with [OpenCode](https://opencode.ai)'s free models, which need no account. New
    conversations start on OpenCode's default free model, and the Mac's model list
-   shows the others.
+   shows the others. The relay uses host networking so the Mac can find it: allow TCP
+   and UDP port 8765 through the computer's firewall. On Docker Desktop for Mac or
+   Windows, see [Docker Desktop](#docker-desktop).
 
 2. **Install the client.** Download `AgentChat.bin` from the
    [latest release](../../releases/latest) (or [build it](#building)), copy it to the Mac
    and decode it with StuffIt Expander.
 
-3. **Connect.** Launch AgentChat, choose File → Connection Settings…, and enter the
-   relay computer's IPv4 address and port 8765. Start typing.
+3. **Connect.** Launch AgentChat. It finds the relay on your network within a few
+   seconds and remembers its address. Start typing.
+
+   To enter an address yourself, choose File → Connection Settings…. Untick **Find relay
+   if address fails** to use only that address.
 
 > The agent can change files on your Mac. It writes atomically and won't delete
 > folders recursively, but keep backups of anything you care about.
@@ -77,6 +81,48 @@ are kept in the `agentchat-data` volume.
 
 Without Docker, run the relay directly with Python 3.12, `pip install Pillow`, `unar`
 and OpenCode installed: `python3 relay/start.py`.
+
+### Docker Desktop
+
+Docker Desktop's network doesn't pass the Mac's discovery broadcast through, so start the
+relay with ports published instead and enter the computer's address in Connection
+Settings:
+
+```sh
+docker compose -f compose.yaml -f compose.desktop.yaml up -d
+```
+
+Use the same `-f` options with later `docker compose` commands.
+
+### Discovery
+
+The Mac asks for a relay with a UDP broadcast on port 8765, and the relay replies with
+its chat port. Discovery doesn't cross routers or VLANs and doesn't authenticate the
+relay, so use it on a network you trust; with several relays, enter the one you want.
+To turn the relay's side off, set `AGENT_DISCOVERY=0` before `docker compose up -d`.
+
+## Use the Mac from your own coding agent
+
+The relay's Mac tools are also an [MCP](https://modelcontextprotocol.io) server, so a
+coding agent on your modern computer (Claude Code, Codex and others) can use the Mac
+directly: list and copy files, install software, launch programs, take screenshots.
+Register this command as a stdio MCP server, run in the folder with `compose.yaml`
+(add `ssh <relay-host>` in front if the relay runs on another machine):
+
+```sh
+docker compose exec -T relay python3 /app/bridge/mac_mcp.py
+```
+
+For example, with Claude Code:
+`claude mcp add agentchat -- docker compose -f /path/to/agentchat/compose.yaml exec -T relay python3 /app/bridge/mac_mcp.py`.
+An agent that can't add a server mid-session can call one tool per command:
+`docker compose exec -T relay python3 /app/bridge/mac_mcp.py --call imac_list_volumes '{}'`.
+
+The tools read files on the relay's side. To send a file from your computer, copy it into
+the container first (`docker compose exec relay mkdir -p /data/transfer`, then
+`docker compose cp FILE relay:/data/transfer/`) and import it from `/data/transfer/FILE`.
+Ask the agent to start with `imac_read_guide`, which explains Classic Mac files,
+resource forks and installing software.
 
 ## Building
 

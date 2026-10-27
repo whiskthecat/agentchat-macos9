@@ -66,6 +66,7 @@ from vm_debug import VM_DEBUG
 from chat_images import ImageStore, Upload
 from tool_questions import ToolQuestions
 from mac_context import MCP_TOOL_TIMEOUT_SEC, session_instructions
+from relay_discovery import start_discovery
 
 SERVER = os.environ.get("OPENCODE_URL", "http://127.0.0.1:7777")
 OPENCODE_ENABLED = os.environ.get("OPENCODE_ENABLED", "1") == "1"
@@ -924,6 +925,32 @@ class ChatHandler(TCPHandler):
             send("X:" + reason)
             return
         sess.send = send
+        def send_binary(expected_connection, token, nonce, count, chunks):
+            from mac_binary import write_body
+            failure = None
+            with lock:
+                if (stopped.is_set() or expected_connection != connection_id or
+                        sess.connection_id != expected_connection):
+                    # A stale transaction must not close a replacement socket.
+                    raise RuntimeError("Binary fork connection changed")
+                try:
+                    write_body(self.wfile, token, nonce, count, chunks)
+                except Exception as exc:
+                    # Queued heartbeat/reply writers must see stopped before
+                    # the lock is released, including source-read failures.
+                    stopped.set()
+                    failure = exc
+            if failure is not None:
+                end_connection()
+                raise failure
+
+        def abort_binary(expected_connection):
+            if expected_connection == connection_id:
+                end_connection()
+
+        # Explicit diagnostic baseline; capability absence keeps legacy chunks.
+        sess.send_binary = send_binary if os.environ.get("AGENT_MAC_BINARY", "1") != "0" else None
+        sess.abort_binary = abort_binary
         sess.questions_supported = False
         sess.alive = True
         sess.disconnected_at = None
@@ -1144,9 +1171,13 @@ class Server(socketserver.ThreadingTCPServer):
 
 def main():
     global SERVER
+    discovery = None
     url = sys.argv[1] if len(sys.argv) > 1 else SERVER
     SERVER = url
     def shutdown(signum, frame):
+        if discovery is not None:
+            discovery.shutdown()
+            discovery.server_close()
         VM_DEBUG.close()
         for session in list(REG.values()):
             try:
@@ -1164,7 +1195,9 @@ def main():
         % (CHAT_PORT, ADMIN_PORT, SERVER, CONFIGURED_MODEL or "(first available)", MAX_SESSIONS))
     threading.Thread(target=Server(("127.0.0.1", ADMIN_PORT), AdminHandler)
                     .serve_forever, daemon=True).start()
-    Server(("0.0.0.0", CHAT_PORT), ChatHandler).serve_forever()
+    with Server(("0.0.0.0", CHAT_PORT), ChatHandler) as chat:
+        discovery = start_discovery(CHAT_PORT, log)
+        chat.serve_forever()
 
 
 if __name__ == "__main__":

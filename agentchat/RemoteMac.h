@@ -23,6 +23,12 @@ typedef OSErr (*RemoteMacActionProc)(const char *, const char *);
 void RemoteMacInit(RemoteMacSendProc, RemoteMacStateProc, RemoteMacActionProc);
 void RemoteMacSetApplicationIdle(RemoteApplicationIdleProc, void *context);
 Boolean RemoteMacHandle(char *command);
+/* Exact-length binary phase. Any error/expiry requires transport disconnect. */
+OSErr RemoteMacBinaryBegin(char *header);
+long RemoteMacBinaryRemaining(void);
+char *RemoteMacBinaryBuffer(void);
+OSErr RemoteMacBinaryReceive(const char *bytes, long count);
+Boolean RemoteMacBinaryFailed(void);
 /* Stop consuming incoming commands while FALSE, including any buffered tail. */
 Boolean RemoteMacCanReceive(void);
 /* Reserve this capacity before scheduling optional image-upload bytes. */

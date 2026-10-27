@@ -1,15 +1,17 @@
 """Real local archive extraction and bounded native-import fixtures; no inference."""
 import hashlib
+import binascii
 import json
 from pathlib import Path, PurePosixPath
 import struct
 import tempfile
+import tracemalloc
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zipfile
 
-from mac_archive import analyze_entries, import_archive, inspect_archive, plan_archive, select_entries
+from mac_archive import ARCHIVE_LIMIT, EXPANDED_LIMIT, analyze_entries, import_archive, inspect_archive, plan_archive, select_entries, load_source, import_problems
 from remote_mac import MacTools
 
 
@@ -25,14 +27,63 @@ class RecordingMac:
         self.calls.append((op, args))
         if op == self.fail: raise RuntimeError("fixture " + op + " failure")
         return {}
-    def write(self, path, data, **args):
-        self.calls.append(("write", {"path": path, "data": data, **args}))
+    def import_file(self, args):
+        data = Path(args["host_path"]).read_bytes()
+        self.calls.append(("write", {"path": args["destination"], "data": data, **args}))
         if self.fail == "resource" and args.get("fork") == "resource": raise RuntimeError("fixture fork failure")
-        return {}
+        return {"written": len(data), "sha256": hashlib.sha256(data).hexdigest()}
     def call(self, op, args): self.calls.append((op, args)); return {}
 
 
 class ArchiveWorkflowTests(unittest.TestCase):
+    def test_large_macbinary_both_forks_stream_from_disk_with_bounded_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "large.bin"
+            size, resource = 17 * 1024 * 1024 + 23, b"resource fixture\0" * 500
+            header = bytearray(128); header[1] = 5; header[2:7] = b"Large"
+            header[65:73] = b"APPLBN98"; header[83:91] = struct.pack(">II", size, len(resource))
+            header[122:124] = b"\x81\x81"; header[124:126] = struct.pack(">H", binascii.crc_hqx(header[:124], 0))
+            with archive.open("wb") as stream:
+                stream.write(header); stream.seek(128 + (size + 127) // 128 * 128)
+                stream.write(resource); stream.write(b"\0" * (-len(resource) % 128))
+            class StreamingMac(RecordingMac):
+                def import_file(self, args):
+                    # A recording sink retains hashes and counters only.
+                    digest, total = hashlib.sha256(), 0
+                    with open(args["host_path"], "rb") as source:
+                        while raw := source.read(65536): digest.update(raw); total += len(raw)
+                    self.calls.append(("import_file", dict(args, written=total)))
+                    return {"written": total, "sha256": digest.hexdigest(), "transport": "recording"}
+            tracemalloc.start()
+            try:
+                with patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file read")):
+                    inventory = inspect_archive({"host_path": str(archive)})
+                    mac = StreamingMac(); result = import_archive(mac, {"host_path": str(archive), "destination": "Disk:New"})
+                _, peak = tracemalloc.get_traced_memory()
+            finally: tracemalloc.stop()
+            self.assertLess(peak, 4 * 1024 * 1024)
+            self.assertTrue(inventory["importable"]); self.assertEqual(inventory["format"], "MacBinary")
+            imported = result["files"][0]
+            self.assertEqual((imported["data_bytes"], imported["resource_bytes"]), (size, len(resource)))
+            digest = hashlib.sha256()
+            for offset in range(0, size, 65536): digest.update(bytes(min(65536, size - offset)))
+            self.assertEqual(imported["data_sha256"], digest.hexdigest())
+            self.assertEqual(imported["resource_sha256"], hashlib.sha256(resource).hexdigest())
+            self.assertEqual((imported["type"], imported["creator"]), ("APPL", "BN98"))
+            self.assertTrue([p for op, p in mac.calls if op == "import_file"][0]["create_only"])
+
+    def test_64_mib_bounds_reject_oversized_archive_and_expansion_before_guest_writes(self):
+        self.assertEqual(ARCHIVE_LIMIT, 64 * 1024 * 1024)
+        self.assertEqual(EXPANDED_LIMIT, ARCHIVE_LIMIT)
+        self.assertFalse(import_problems(set(), {}, EXPANDED_LIMIT))
+        self.assertTrue(import_problems(set(), {}, EXPANDED_LIMIT + 1))
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "too-large"; source.touch()
+            with source.open("wb") as stream: stream.truncate(ARCHIVE_LIMIT + 1)
+            with self.assertRaisesRegex(ValueError, "64 MiB"):
+                load_source({"host_path": str(source)}, Path(tmp) / "copy")
+            self.assertFalse((Path(tmp) / "copy").exists())
+
     def test_real_zip_inspection_selection_and_exact_literal_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "collection.zip"
@@ -49,7 +100,7 @@ class ArchiveWorkflowTests(unittest.TestCase):
             output = Path(tmp) / "out"; output.mkdir()
             folders, files = plan_archive(archive, output, ["Game/App[1]"])
             self.assertEqual(folders, [PurePosixPath("Game")])
-            self.assertEqual([(f["relative"], f["data"]) for f in files], [("Game/App[1]", b"application fixture")])
+            self.assertEqual([(f["relative"], f["data"].read_bytes()) for f in files], [("Game/App[1]", b"application fixture")])
             self.assertFalse((output / "Game/App1").exists())
             selected = inspect_archive({"host_path": str(archive), "paths": ["Game"], "limit": 3})
             self.assertTrue(selected["importable"])
@@ -62,7 +113,7 @@ class ArchiveWorkflowTests(unittest.TestCase):
                 z.writestr("Sources/Project", b"project data")
                 z.writestr("Sources/Project.rsrc", b"legitimate separate file")
             _, files = plan_archive(archive, output)
-            self.assertEqual({f["relative"]: f["data"] for f in files},
+            self.assertEqual({f["relative"]: f["data"].read_bytes() for f in files},
                              {"Sources/Project": b"project data", "Sources/Project.rsrc": b"legitimate separate file"})
 
     def test_dual_forks_count_once_and_finder_metadata_is_preserved(self):
@@ -82,17 +133,19 @@ class ArchiveWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch("mac_archive.archive_listing", return_value=listing), patch("mac_archive.subprocess.run", side_effect=extract):
             _, files = plan_archive(Path(tmp) / "archive", Path(tmp))
             self.assertEqual(len(files), 70)
-            self.assertEqual(files[0]["data"], b"DATA"); self.assertEqual(files[0]["resource"], b"RSRC")
+            self.assertEqual(files[0]["data"].read_bytes(), b"DATA"); self.assertEqual(files[0]["resource"].read_bytes(), b"RSRC")
             self.assertEqual((files[0]["type"], files[0]["creator"], files[0]["flags"]), ("APPL", "TEST", 0x2100))
 
     def test_native_import_keeps_resource_only_app_and_rolls_back_owned_files(self):
         entry = {"relative": "Game/App", "data": b"", "resource": b"CODE fixture", "type": "APPL", "creator": "TEST", "flags": 0x2100}
         with tempfile.TemporaryDirectory() as tmp, patch("mac_archive.plan_archive", return_value=([PurePosixPath("Game")], [entry])):
             archive = Path(tmp) / "source"; archive.write_bytes(b"archive")
+            for fork in ("data", "resource"):
+                file = Path(tmp) / fork; file.write_bytes(entry[fork]); entry[fork] = file
             args = {"host_path": str(archive), "destination": "Disk:New game"}
             mac = RecordingMac(); report = import_archive(mac, args)
             self.assertEqual(report["files"][0]["data_bytes"], 0)
-            self.assertEqual(report["files"][0]["resource_sha256"], hashlib.sha256(entry["resource"]).hexdigest())
+            self.assertEqual(report["files"][0]["resource_sha256"], hashlib.sha256(entry["resource"].read_bytes()).hexdigest())
             writes = [c[1] for c in mac.calls if c[0] == "write"]
             self.assertTrue(writes[0]["create_only"]); self.assertEqual(writes[1]["fork"], "resource")
             mac = RecordingMac("resource")

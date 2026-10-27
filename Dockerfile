@@ -22,4 +22,5 @@ ENV HOME=/data \
     OPENCODE_URL=http://127.0.0.1:7777
 VOLUME /data
 EXPOSE 8765
+EXPOSE 8765/udp
 CMD ["python3", "-u", "/app/relay/start.py"]

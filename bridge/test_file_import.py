@@ -224,7 +224,7 @@ class ImportTests(unittest.TestCase):
         self.assertIn(self.destination, self.broker.files)
 
     def test_import_timeout_is_bounded_and_other_tools_keep_existing_timeout(self):
-        for name, seconds in (("imac_import_file", 600), ("imac_read_file", 120), ("imac_import_archive", 120)):
+        for name, seconds in (("imac_import_file", 600), ("imac_read_file", 120), ("imac_import_archive", 600)):
             with self.subTest(name=name):
                 connection = mock.MagicMock()
                 connection.__enter__.return_value = connection

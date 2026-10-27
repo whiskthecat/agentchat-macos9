@@ -7,10 +7,10 @@
  * a wrong-app launch).  Format: small incremental integer, +1 per deploy
  * (was YYYY-MM-DD+letter until 2026-09-29d, then moved to v13 onward).
  * Rendered as "AgentChat v<VER>" by the About string in agentchat.c. */
-#define AGENTCHAT_VERSION "97"
+#define AGENTCHAT_VERSION "98"
 
-/* host running bridge/agentd.py (this host, on the LAN) */
-#define AGENT_HOST  "192.168.1.173"
+/* Empty means find a relay on the local network. Saved settings take priority. */
+#define AGENT_HOST  ""
 #define AGENT_PORT  8765
 
 /* mini file server carrying self-update builds */

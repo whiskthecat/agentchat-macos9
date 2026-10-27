@@ -67,7 +67,7 @@ resource 'DITL' (133) { {
 } };
 
 resource 'DLOG' (135) {
-    { 90, 160, 366, 560 }, noGrowDocProc, visible, goAway, 0, 135,
+    { 70, 160, 386, 560 }, noGrowDocProc, visible, goAway, 0, 135,
     "Connection Settings", centerMainScreen
 };
 /* Appearance owns the Platinum background, edit frames and movable modal
@@ -88,19 +88,21 @@ resource 'CNTL' (1351) {
 };
 resource 'DITL' (135) { {
     { 44, 176, 62, 372 }, EditText { enabled, "" };
-    { 244, 294, 264, 386 }, Button { enabled, "Connect" };
-    { 244, 190, 264, 282 }, Button { enabled, "Cancel" };
+    { 284, 294, 304, 386 }, Button { enabled, "Connect" };
+    { 284, 190, 304, 282 }, Button { enabled, "Cancel" };
     { 44, 30, 62, 166 }, StaticText { enabled, "Bridge address:" };
     { 80, 176, 98, 250 }, EditText { enabled, "" };
     { 80, 30, 98, 166 }, StaticText { enabled, "Chat port:" };
     { 112, 176, 130, 250 }, EditText { enabled, "" };
     { 112, 30, 130, 166 }, StaticText { enabled, "Update HTTP port:" };
     { 185, 30, 203, 370 }, CheckBox { enabled, "Connect when AgentChat starts" };
-    { 220, 14, 238, 386 }, StaticText { enabled, "" };
-    { 244, 14, 264, 100 }, Button { enabled, "Defaults" };
+    { 260, 14, 278, 386 }, StaticText { enabled, "Blank address: find relay on the local network." };
+    { 284, 14, 304, 100 }, Button { enabled, "Defaults" };
     { 16, 14, 154, 386 }, Control { enabled, 1350 };
     { 164, 14, 215, 386 }, Control { enabled, 1351 };
-    { 244, 108, 264, 182 }, Button { enabled, "Models..." };
+    { 284, 108, 304, 182 }, Button { enabled, "Models..." };
+    { 230, 30, 248, 270 }, CheckBox { enabled, "Find relay if address fails" };
+    { 228, 276, 250, 372 }, Button { enabled, "Find Relay" };
     { 0, 0, 0, 0 }, HelpItem { disabled, HMScanhdlg { 135 } };
 } };
 

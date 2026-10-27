@@ -1,5 +1,6 @@
 """New game workflow tools, isolated host fixtures and synthetic QMP only."""
 import json
+import hashlib
 from pathlib import Path
 import struct
 import tempfile
@@ -53,12 +54,17 @@ class ArchiveTests(unittest.TestCase):
         class Mac:
             def __init__(self,fail=False): self.calls=[]; self.fail=fail
             def rpc(self,op,**args): self.calls.append((op,args)); return {}
-            def write(self,path,data,**args): self.calls.append(("write",path,data,args)); return {}
+            def import_file(self,args):
+                data = Path(args["host_path"]).read_bytes()
+                self.calls.append(("write",args["destination"],data,args))
+                return {"written":len(data), "sha256":hashlib.sha256(data).hexdigest()}
             def call(self,name,args):
                 self.calls.append((name,args))
                 if self.fail: raise RuntimeError("metadata failed")
         with tempfile.TemporaryDirectory() as t, patch("mac_archive.plan_archive",return_value=([],[entry])):
             archive=Path(t)/"source"; archive.write_bytes(b"archive")
+            for fork in ("data", "resource"):
+                file=Path(t)/fork; file.write_bytes(entry[fork]); entry[fork]=file
             args={"host_path":str(archive),"destination":"Disk:New game"}
             mac=Mac(); report=import_archive(mac,args)
             self.assertEqual(report["files"][0]["finder_flags"],0x2000)

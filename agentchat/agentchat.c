@@ -46,6 +46,7 @@
 #include <OpenTransportProviders.h>
 
 #include "AgentChatConfig.h"
+#include "RelayDiscovery.h"
 #include "AgentChatHelp.h"
 #include "RemoteMac.h"
 #include "IdleMetrics.h"
@@ -273,6 +274,7 @@ static void text_range(TranscriptPosition *a, TranscriptPosition *b) {
 }
 static char gFindText[128] = "";
 static void history_line(char tag, char *payload);
+static void nav_new_chat(void);
 static void model_line(char tag, char *payload);
 static void request_model(const char *id);
 static char *new_draft(void);
@@ -440,6 +442,11 @@ typedef struct {
     char model[128];
 } ConnectionPrefs;
 static ConnectionPrefs gPrefs = { 'AC02', AGENT_HOST, AGENT_PORT, HTTP_PORT, 1, "", "" };
+/* Keep AC02's size/layout and legacy startup=0/1 records unchanged. */
+#define PREF_STARTUP 1
+#define PREF_DISCOVERY_OFF 2
+static Boolean gDiscoverNext = FALSE, gUsingDiscovered = FALSE;
+static DiscoveredRelay gDiscovered;
 static int         gConnPhase = 0;      /* 0=down 1=async-connecting 2=up */
 static UInt32      gConnectStart = 0;
 #ifndef mc68000
@@ -1021,7 +1028,7 @@ static void load_preferences(void)
     if (n == sizeof prefs && prefs.magic == 'AC02') {
         prefs.host[63] = 0; prefs.lastID[95] = 0;
         prefs.model[127] = 0;
-        if (valid_address(prefs.host) && prefs.chatPort && prefs.updatePort) gPrefs = prefs;
+        if ((!prefs.host[0] || valid_address(prefs.host)) && prefs.chatPort && prefs.updatePort) gPrefs = prefs;
     }
     FSClose(fd);
 }
@@ -1042,8 +1049,23 @@ static void save_preferences(void)
 }
 
 /* ---------------- connection ---------------- */
+static void select_relay(const char *host, UInt16 chat, UInt16 update)
+{
+    if (strcmp(gPrefs.host, host) != 0 || gPrefs.chatPort != chat) {
+        char begin[] = "BEGIN", end[] = "END";
+        gPrefs.lastID[0] = 0; gActiveID[0] = 0;
+        gChatCount = 0; gNewDraft[0] = 0;
+        gModelCount = 0; gModelID[0] = gPrefs.model[0] = 0;
+        nav_new_chat();
+        history_line('J', begin); history_line('J', end);
+    }
+    strcpy(gPrefs.host, host); gPrefs.chatPort = chat; gPrefs.updatePort = update;
+}
+
 static void close_conn(void)
 {
+    RelayDiscoveryCancel();
+    gUsingDiscovered = FALSE;
     ToolQuestionsReset();
     ChatImagesDisconnect();
     RemoteMacReset();
@@ -1083,6 +1105,8 @@ static void try_connect(void)
     TCall call;
     InetAddress addr;
     TBind bindreq;
+    const char *host;
+    UInt16 chatPort;
     UInt32 now = TickCount();
 
     if (gConnected) return;
@@ -1107,13 +1131,41 @@ static void try_connect(void)
             boot_trace("OT: connect timeout, dropping endpoint");
             if (gEP) { OTCloseProvider(gEP); gEP = 0; }
             gConnPhase = 0;
+            gDiscoverNext = TRUE;
+            gUsingDiscovered = FALSE;
             set_status("offline (no answer from bridge)");
         }
         return;
     }
 
-    if (gLastTry != 0 && now - gLastTry < 5u * 60u) return;
-    gLastTry = now;
+    if (RelayDiscoveryActive()) {
+        short found = RelayDiscoveryPoll(&gDiscovered);
+        if (!found) return;
+        gDiscoverNext = FALSE;
+        if (found < 0) {
+            gLastTry = now;
+            set_status("no relay found; check Connection Settings");
+            return;
+        }
+        gUsingDiscovered = TRUE;
+    } else {
+        UInt32 delay = (!gPrefs.host[0] ? 30u : 5u) * 60u;
+        if (gLastTry != 0 && now - gLastTry < delay) return;
+        gLastTry = now;
+        if ((gDiscoverNext || !gPrefs.host[0]) && !(gPrefs.startup & PREF_DISCOVERY_OFF)) {
+            gDiscoverNext = FALSE;
+            if (RelayDiscoveryStart(AGENT_PORT)) set_status("finding relay on local network...");
+            else {
+                sprintf(m, "discovery unavailable (%ld); use Connection Settings", RelayDiscoveryLastError());
+                set_status(m);
+            }
+            return;
+        }
+        gDiscoverNext = FALSE;
+        if (!gPrefs.host[0]) { set_status("set a bridge address or enable discovery"); return; }
+    }
+    host = gUsingDiscovered ? gDiscovered.host : gPrefs.host;
+    chatPort = gUsingDiscovered ? gDiscovered.chatPort : gPrefs.chatPort;
 
     boot_trace("OT: OTCreateConfiguration+OpenEndpoint...");
     ep = OTOpenEndpoint(OTCreateConfiguration(kTCPName), 0, NULL, &err);
@@ -1161,12 +1213,12 @@ static void try_connect(void)
 
     OTMemzero(&call, sizeof(call));
     OTMemzero(&addr, sizeof(addr));
-    OTInitInetAddress(&addr, (InetPort)port_to_nbo(gPrefs.chatPort),
-                      (InetHost)ip_to_nbo(gPrefs.host));
+    OTInitInetAddress(&addr, (InetPort)port_to_nbo(chatPort),
+                      (InetHost)ip_to_nbo(host));
     call.addr.buf = (UInt8 *)&addr;
     call.addr.len = call.addr.maxlen = (long)sizeof(addr);
 
-    sprintf(m, "OT: async OTConnect %s ...", gPrefs.host);
+    sprintf(m, "OT: async OTConnect %s ...", host);
     set_status(m);
     boot_trace(m);
     /* Async OTConnect legitimately returns kOTNoDataErr (-3162) meaning
@@ -1174,6 +1226,8 @@ static void try_connect(void)
     err = OTConnect(ep, &call, NULL);
     if (err != kOTNoError && err != (OSStatus)kOTNoDataErr) {
         OTCloseProvider(ep);
+        gDiscoverNext = TRUE;
+        gUsingDiscovered = FALSE;
         sprintf(m, "connect err=%ld (bridge down?)", err);
         set_status(m);
         boot_trace(m);
@@ -1205,6 +1259,12 @@ static void pump_ot_events(void)
         sprintf(m, "OT: rcvconnect=%ld", (long)cerr);
         boot_trace(m);
         if (cerr == noErr) {
+            if (gUsingDiscovered) {
+                select_relay(gDiscovered.host, gDiscovered.chatPort, gDiscovered.updatePort);
+                save_preferences();
+                gUsingDiscovered = FALSE;
+            }
+            gDiscoverNext = FALSE;
             gConnPhase = 2;
             gConnected = TRUE;
             gRelayLastReceive = TickCount();
@@ -1218,15 +1278,19 @@ static void pump_ot_events(void)
             OTCloseProvider(gEP);
             gEP = 0;
             gConnPhase = 0;
+            gDiscoverNext = TRUE;
+            gUsingDiscovered = FALSE;
             sprintf(m, "offline (rcvconnect %ld)", (long)cerr);
             set_status(m);
         }
     }
-    if (gConnected && (ev & (T_DISCONNECT | T_ORDREL))) {
+    if ((gConnected || gConnPhase == 1) && (ev & (T_DISCONNECT | T_ORDREL))) {
+        Boolean failedConnect = !gConnected;
         if (ev & T_ORDREL) OTRcvOrderlyDisconnect(gEP);
         flush_cur();
         push_line("** connection lost");
         close_conn();
+        gDiscoverNext = failedConnect; /* a lost working relay is retried first */
         gConnPhase = 0;
         set_status("connection lost");
     }
@@ -1236,19 +1300,41 @@ static void pump_ot_events(void)
 /* ---------------- receive / dispatch ---------------- */
 static void handle_line(char *line);
 
+#ifndef AGENTCHAT_BINARY_BURST_TICKS
+#define AGENTCHAT_BINARY_BURST_TICKS 2u
+#endif
 static void poll_recv(void)
 {
     OTFlags flags;
     long n;
+    UInt32 started = TickCount();
 
     if (!gConnected || gReceiving) return;
     gReceiving = TRUE;
     /* Modal idle loops also call poll_recv. Retry prepared bytes here so a
      * full queue cannot leave a reply waiting until a dialog is dismissed. */
     RemoteMacTick();
+    if (RemoteMacBinaryFailed()) close_conn();
     while (gConnected && RemoteMacCanReceive()) {
         if (gRecvPos >= gRecvLen) {
             gRecvLen = gRecvPos = 0;
+            /* Read straight into a reusable Memory Manager buffer while in
+             * body mode. Never read past its boundary into the next line. */
+            n = RemoteMacBinaryRemaining();
+            if (n) {
+                if (n > 65536L) n = 65536L;
+                IdleMetricsReceive();
+                n = (long)OTRcv(gEP, RemoteMacBinaryBuffer(), n, &flags);
+                if (n == kOTNoDataErr || n == 0) break;
+                if (n < 0 || RemoteMacBinaryReceive(RemoteMacBinaryBuffer(), n) != noErr) {
+                    close_conn(); set_status("binary import aborted"); break;
+                }
+                gRelayLastReceive = TickCount();
+                /* At most two ticks plus one bounded fork write per burst.
+                 * The outer WaitNextEvent(0) yields and services native UI. */
+                if ((UInt32)(TickCount() - started) >= AGENTCHAT_BINARY_BURST_TICKS) break;
+                continue;
+            }
             IdleMetricsReceive();
             n = (long)OTRcv(gEP, gRecv, sizeof(gRecv), &flags);
             if (n == kOTNoDataErr || n == 0) break;
@@ -1263,11 +1349,26 @@ static void poll_recv(void)
             gRelayLastReceive = TickCount();
         }
         while (gRecvPos < gRecvLen && gConnected && RemoteMacCanReceive()) {
+            n = RemoteMacBinaryRemaining();
+            if (n) {
+                if (n > gRecvLen - gRecvPos) n = gRecvLen - gRecvPos;
+                if (RemoteMacBinaryReceive(gRecv + gRecvPos, n) != noErr) {
+                    close_conn(); set_status("binary import aborted"); break;
+                }
+                gRecvPos += n;
+                continue;
+            }
             char ch = gRecv[gRecvPos++];
             if (ch == '\n' || ch == '\r') {
                 if (gAccumLen > 0) {
                     gAccum[gAccumLen] = 0;
-                    handle_line(gAccum);
+                    if (!strncmp(gAccum, "B:", 2)) {
+                        /* Binary headers use exactly LF. Accepting CRLF here
+                         * would turn its LF into the first body byte. */
+                        if (ch != '\n' || RemoteMacBinaryBegin(gAccum) != noErr) {
+                            close_conn(); set_status("invalid binary import frame");
+                        }
+                    } else handle_line(gAccum);
                     gAccumLen = 0;
                 }
             } else if (gAccumLen < (long)sizeof(gAccum) - 1) {
@@ -1605,6 +1706,11 @@ static void do_update(const char *name)
     Boolean stashed = FALSE;
     long ownL;
     long n;
+
+    if (!valid_address(gPrefs.host)) {
+        set_status("connect to a relay before updating");
+        return;
+    }
 
     /* Restore us if the update can't complete after we stashed. */
     #define UNSTASH() do {                                        \
@@ -2844,7 +2950,7 @@ static void nav_reconnect(void)
     if (gBusy) return;
     gAutoConnect = TRUE;
     gLastTry = 0;
-    if (gConnected) close_conn();      /* tear down, then start fresh below   */
+    close_conn();                     /* includes an outstanding connect/search */
     set_status("reconnecting...");
     gNavDirty = TRUE;
     try_connect();
@@ -3830,6 +3936,11 @@ static void ask_update(void)
     ProcessInfoRec info;
     FSSpec me;
 
+    if (!valid_address(gPrefs.host)) {
+        set_status("connect to a relay before updating");
+        return;
+    }
+
     /* Pre-fill with OUR OWN filename + ".NEW" (2026-09-29 incident: the
      * hardcoded "\pAgentChat.NEW" matched a stale wrong-config file in the
      * filer; a user accepting the dialog default launched an app wired to
@@ -4091,7 +4202,7 @@ static void connection_settings(void)
     DialogPtr dlg;
     ModalFilterUPP filter;
     DialogItemType type;
-    Handle check;
+    Handle check, discoveryCheck, findButton;
     Rect rect;
     short hit;
     int chat, update;
@@ -4105,7 +4216,11 @@ static void connection_settings(void)
     snprintf(port, sizeof port, "%u", gPrefs.chatPort); dialog_text(dlg, 5, port);
     snprintf(port, sizeof port, "%u", gPrefs.updatePort); dialog_text(dlg, 7, port);
     GetDialogItem(dlg, 9, &type, &check, &rect);
-    SetControlValue((ControlHandle)check, gPrefs.startup != 0);
+    SetControlValue((ControlHandle)check, (gPrefs.startup & PREF_STARTUP) != 0);
+    GetDialogItem(dlg, 15, &type, &discoveryCheck, &rect);
+    SetControlValue((ControlHandle)discoveryCheck, !(gPrefs.startup & PREF_DISCOVERY_OFF));
+    GetDialogItem(dlg, 16, &type, &findButton, &rect);
+    HiliteControl((ControlHandle)findButton, GetControlValue((ControlHandle)discoveryCheck) ? 0 : 255);
     SelectDialogItemText(dlg, 1, 0, 32767);
     filter = NewModalFilterUPP(update_filter);
     while (1) {
@@ -4113,33 +4228,32 @@ static void connection_settings(void)
         if (hit == 3) break;
         if (hit == 14) break;
         if (hit == 9) SetControlValue((ControlHandle)check, !GetControlValue((ControlHandle)check));
+        if (hit == 15) {
+            SetControlValue((ControlHandle)discoveryCheck, !GetControlValue((ControlHandle)discoveryCheck));
+            HiliteControl((ControlHandle)findButton, GetControlValue((ControlHandle)discoveryCheck) ? 0 : 255);
+        }
         if (hit == 11) {
             dialog_text(dlg, 1, AGENT_HOST);
             snprintf(port, sizeof port, "%u", AGENT_PORT); dialog_text(dlg, 5, port);
             snprintf(port, sizeof port, "%u", HTTP_PORT); dialog_text(dlg, 7, port);
             SetControlValue((ControlHandle)check, 1);
+            SetControlValue((ControlHandle)discoveryCheck, 1);
+            HiliteControl((ControlHandle)findButton, 0);
         }
-        if (hit != 2) continue;
+        if (hit != 2 && hit != 16) continue;
         read_dialog_text(dlg, 1, host, sizeof host);
         chat = dialog_port(dlg, 5); update = dialog_port(dlg, 7);
-        if (!valid_address(host) || !chat || !update) {
-            dialog_text(dlg, 10, "Use IPv4 and port numbers from 1 to 65535."); SysBeep(3); continue;
+        if (hit == 2 && ((host[0] && !valid_address(host)) || !chat || !update)) {
+            dialog_text(dlg, 10, "Use IPv4 and ports 1-65535; blank finds relay."); SysBeep(3); continue;
         }
-        if (strcmp(gPrefs.host, host) != 0 || gPrefs.chatPort != (UInt16)chat) {
-            char begin[] = "BEGIN", end[] = "END";
-            gPrefs.lastID[0] = 0; gActiveID[0] = 0;
-            gChatCount = 0; gNewDraft[0] = 0;
-            gModelCount = 0; gModelID[0] = gPrefs.model[0] = 0;
-            nav_new_chat();
-            history_line('J', begin); history_line('J', end);
-        }
-        strcpy(gPrefs.host, host); gPrefs.chatPort = (UInt16)chat; gPrefs.updatePort = (UInt16)update;
-        gPrefs.startup = GetControlValue((ControlHandle)check) != 0;
+        if (hit == 2) select_relay(host, (UInt16)chat, (UInt16)update);
+        gPrefs.startup = (GetControlValue((ControlHandle)check) ? PREF_STARTUP : 0) |
+            (GetControlValue((ControlHandle)discoveryCheck) ? 0 : PREF_DISCOVERY_OFF);
         save_preferences();
         break;
     }
     DisposeModalFilterUPP(filter); DisposeDialog(dlg);
-    if (hit == 2) nav_reconnect();
+    if (hit == 2 || hit == 16) { gDiscoverNext = hit == 16; nav_reconnect(); }
     redraw(); redraw_nav();
     if (hit == 14) model_settings();
 }
@@ -4391,7 +4505,7 @@ int main(void)
     ModelSettingsInit(send_line);
     ToolQuestionsInit(send_line);
     load_preferences();
-    gAutoConnect = gPrefs.startup != 0;
+    gAutoConnect = (gPrefs.startup & PREF_STARTUP) != 0;
     /* An offline startup still belongs to the bookmarked conversation. Cache
      * drafts there so connecting later cannot replace typed text with an empty
      * editor while restoring its history. */
@@ -4515,7 +4629,7 @@ int main(void)
         IdleMetricsEnd();
         finish_deferred_quit();
         {
-            unsigned long sleep = gTextDragging ? 1 : (RemoteMacBusy() ? 0 : 4);
+            unsigned long sleep = RemoteMacBinaryRemaining() ? 0 : (gTextDragging ? 1 : (RemoteMacBusy() ? 0 : 4));
 #ifndef AGENTCHAT_IDLE_BASELINE
             /* OT's notifier calls WakeUpProcess on arrival. One-second idle
              * background polling is a fallback for missed/coalesced notices

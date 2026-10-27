@@ -5,6 +5,8 @@ We unpack their fork/Finder-info entries before sending bytes to the File Manage
 """
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path, PurePosixPath
 import shutil
 import struct
@@ -14,26 +16,52 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
-ARCHIVE_LIMIT = 16 * 1024 * 1024
-EXPANDED_LIMIT = 4 * 1024 * 1024
+ARCHIVE_LIMIT = 64 * 1024 * 1024
+EXPANDED_LIMIT = 64 * 1024 * 1024
 ENTRY_LIMIT = 128  # Logical HFS files/folders, including parents.
 RECORD_LIMIT = 4096
 LISTING_LIMIT = 2 * 1024 * 1024
 
 
-def appledouble(data):
-    if len(data) < 26: raise ValueError("Truncated AppleDouble header")
-    magic, version = struct.unpack_from(">II", data)
+def appledouble_ranges(stream, size):
+    """Read only the bounded directory, never a potentially 64 MiB fork."""
+    header = stream.read(26)
+    if len(header) != 26: raise ValueError("Truncated AppleDouble header")
+    magic, version = struct.unpack_from(">II", header)
     if magic != 0x00051607 or version not in (0x10000, 0x20000): raise ValueError("Invalid AppleDouble file")
-    count = struct.unpack_from(">H", data, 24)[0]
-    if count > 32 or len(data) < 26 + 12 * count: raise ValueError("Invalid AppleDouble entries")
+    count = struct.unpack_from(">H", header, 24)[0]
+    if count > 32: raise ValueError("Invalid AppleDouble entries")
+    directory = stream.read(count * 12)
+    if len(directory) != count * 12: raise ValueError("Invalid AppleDouble entries")
     entries = {}; ranges = []
     for i in range(count):
-        key, offset, size = struct.unpack_from(">III", data, 26+i*12)
-        if key in entries or offset < 26 + 12*count or offset+size > len(data): raise ValueError("Invalid AppleDouble range")
-        if any(offset < end and offset+size > start for start,end in ranges): raise ValueError("Overlapping AppleDouble ranges")
-        ranges.append((offset,offset+size)); entries[key] = data[offset:offset+size]
+        key, offset, length = struct.unpack_from(">III", directory, i * 12)
+        if key in entries or offset < 26 + 12 * count or offset + length > size: raise ValueError("Invalid AppleDouble range")
+        if any(offset < end and offset + length > start for start, end in ranges): raise ValueError("Overlapping AppleDouble ranges")
+        ranges.append((offset, offset + length)); entries[key] = (offset, length)
     return entries
+
+
+def appledouble(data):
+    import io
+    entries = appledouble_ranges(io.BytesIO(data), len(data))
+    return {key: data[offset:offset + size] for key, (offset, size) in entries.items()}
+
+
+def extract_resource(sidecar, resource):
+    """Materialize one raw resource fork on disk, with bounded memory."""
+    info = None
+    with sidecar.open("rb") as source:
+        entries = appledouble_ranges(source, os.fstat(source.fileno()).st_size)
+        if 9 in entries:
+            offset, size = entries[9]; source.seek(offset); info = source.read(min(size, 32))
+        offset, remaining = entries.get(2, (0, 0)); source.seek(offset)
+        with resource.open("wb") as target:
+            while remaining:
+                raw = source.read(min(65536, remaining))
+                if not raw: raise ValueError("Truncated AppleDouble fork")
+                target.write(raw); remaining -= len(raw)
+    return info
 
 
 def safe_name(name):
@@ -112,7 +140,7 @@ def import_problems(folders, files, total):
     if count > ENTRY_LIMIT:
         problems.append("Archive selection has %d logical HFS files/folders; the limit is %d. Use imac_inspect_archive and paths to select a needed subset." % (count, ENTRY_LIMIT))
     if total > EXPANDED_LIMIT:
-        problems.append("Selected forks expand to %d bytes; the limit is 4 MiB. Select a smaller subset with paths." % total)
+        problems.append("Selected forks expand to %d bytes; the limit is 64 MiB. Select a smaller subset with paths." % total)
     return problems
 
 
@@ -160,43 +188,58 @@ def plan_archive(archive, output, paths=None):
         elif relative not in folders: raise ValueError("Unexpected extracted directory: " + str(relative))
     if expanded > EXPANDED_LIMIT + ENTRY_LIMIT * 4096: raise ValueError("Extracted output exceeds limit")
     result = []
+    fork_output = Path(tempfile.mkdtemp(prefix=".agentchat-forks-", dir=output))
     for path, forks in sorted(files.items(), key=lambda x: str(x[0])):
         file = output.joinpath(*path.parts); sidecar = output.joinpath(*sidecar_path(path, mode).parts)
-        data = file.read_bytes() if file.exists() else b""
-        resource = b""; metadata = forks.get("resource", forks.get("data")); info = None
-        if sidecar.exists():
-            extra = appledouble(sidecar.read_bytes()); resource = extra.get(2, b""); info = extra.get(9)
-        for key, value in (("data", data), ("resource", resource)):
+        # unar can omit the empty data fork of a resource-only application.
+        if not file.exists(): file.touch()
+        resource = fork_output / ("%04d.resource" % len(result))
+        info = extract_resource(sidecar, resource) if sidecar.exists() else None
+        if not resource.exists(): resource.touch()
+        for key, value in (("data", file), ("resource", resource)):
             expected = forks.get(key, {}).get("XADFileSize", 0)
-            if len(value) != expected: raise ValueError("Extracted %s fork length mismatch: %s" % (key, path))
+            if value.stat().st_size != expected: raise ValueError("Extracted %s fork length mismatch: %s" % (key, path))
+        metadata = forks.get("resource", forks.get("data"))
         type_code, creator, flags = finder_info(metadata, info)
-        result.append({"relative": str(path), "data": data, "resource": resource, "type": type_code, "creator": creator, "flags": flags})
+        result.append({"relative": str(path), "data": file, "resource": resource, "type": type_code, "creator": creator, "flags": flags})
     return sorted(folders, key=lambda p: (len(p.parts), str(p))), result
 
 
 def load_source(args, archive):
     if bool(args.get("url")) == bool(args.get("host_path")): raise ValueError("Supply exactly one url or host_path")
+    original = None
     if args.get("url"):
         if urlparse(args["url"]).scheme not in ("http", "https"): raise ValueError("Archive URL must use HTTP or HTTPS")
-        with urllib.request.urlopen(args["url"], timeout=5) as stream:
-            if urlparse(stream.url).scheme not in ("http", "https"): raise ValueError("Unsupported archive redirect")
-            chunks = []; size = 0; deadline = time.monotonic() + 30
-            while size <= ARCHIVE_LIMIT:
-                if time.monotonic() > deadline: raise TimeoutError("Archive download exceeded 30 seconds")
-                chunk = stream.read1(min(65536, ARCHIVE_LIMIT + 1 - size))
-                if not chunk: break
-                chunks.append(chunk); size += len(chunk)
-            content = b"".join(chunks)
+        source = urllib.request.urlopen(args["url"], timeout=5)
+        if urlparse(source.url).scheme not in ("http", "https"):
+            source.close(); raise ValueError("Unsupported archive redirect")
     else:
         path = Path(args["host_path"])
-        if not path.is_absolute() or not path.is_file(): raise ValueError("host_path must be an absolute regular archive file on the relay host")
-        with path.open("rb") as stream: content = stream.read(ARCHIVE_LIMIT + 1)
-    if not content: raise ValueError("Archive is empty; check the download and its redirects")
-    if len(content) > ARCHIVE_LIMIT: raise ValueError("Archive exceeds 16 MiB")
-    digest = hashlib.sha256(content).hexdigest()
-    if args.get("expected_sha256") and digest != args["expected_sha256"]: raise ValueError("Archive checksum mismatch")
-    archive.write_bytes(content)
-    return digest
+        if not path.is_absolute(): raise ValueError("host_path must be an absolute regular archive file on the relay host")
+        source = os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)), "rb")
+    with source:
+        if not args.get("url"):
+            original = os.fstat(source.fileno())
+            if not stat.S_ISREG(original.st_mode): raise ValueError("host_path must be a regular archive file")
+            if original.st_size > ARCHIVE_LIMIT: raise ValueError("Archive exceeds 64 MiB")
+        digest, size, deadline = hashlib.sha256(), 0, time.monotonic() + 30
+        with archive.open("wb") as target:
+            while size <= ARCHIVE_LIMIT:
+                if args.get("url") and time.monotonic() > deadline: raise TimeoutError("Archive download exceeded 30 seconds")
+                read = source.read1 if args.get("url") else source.read
+                raw = read(min(65536, ARCHIVE_LIMIT + 1 - size))
+                if not raw: break
+                size += len(raw)
+                if size > ARCHIVE_LIMIT: raise ValueError("Archive exceeds 64 MiB")
+                digest.update(raw); target.write(raw)
+        if original is not None:
+            fingerprint = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            if size != original.st_size or fingerprint(original) != fingerprint(os.fstat(source.fileno())):
+                raise ValueError("Host archive changed while checking its checksum")
+    if not size: raise ValueError("Archive is empty; check the download and its redirects")
+    checksum = digest.hexdigest()
+    if args.get("expected_sha256") and checksum != args["expected_sha256"].lower(): raise ValueError("Archive checksum mismatch")
+    return checksum
 
 
 def inspect_archive(args):
@@ -254,11 +297,16 @@ def import_archive(mac, args):
             report = []
             for entry in files:
                 path = destination + ":" + entry["relative"].replace("/", ":")
-                mac.write(path, entry["data"], create_only=True); owned.append(path)
-                if entry["resource"]: mac.write(path, entry["resource"], fork="resource")
+                data = mac.import_file({"host_path": str(entry["data"].resolve()), "destination": path, "create_only": True})
+                owned.append(path)
+                resource = None
+                if entry["resource"].stat().st_size:
+                    resource = mac.import_file({"host_path": str(entry["resource"].resolve()), "destination": path,
+                                                "fork": "resource", "create_only": False})
                 mac.call("imac_set_file_info", {"path": path, "type": entry["type"], "creator": entry["creator"], "flags": entry["flags"]})
-                report.append({"path": path, "data_bytes": len(entry["data"]), "resource_bytes": len(entry["resource"]),
-                               "data_sha256": hashlib.sha256(entry["data"]).hexdigest(), "resource_sha256": hashlib.sha256(entry["resource"]).hexdigest(),
+                report.append({"path": path, "data_bytes": data["written"], "resource_bytes": resource["written"] if resource else 0,
+                               "data_sha256": data["sha256"], "resource_sha256": resource["sha256"] if resource else hashlib.sha256(b"").hexdigest(),
+                               "data_transport": data.get("transport"), "resource_transport": resource.get("transport") if resource else None,
                                "type": entry["type"], "creator": entry["creator"], "finder_flags": entry["flags"] & ~0x100})
             return {"destination": destination, "archive_sha256": digest, "files": report, "folders": len(folders) + 1}
         except Exception as exc:

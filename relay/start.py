@@ -31,8 +31,12 @@ if os.environ.get('CODEX_ENABLED') is None:
     signed_in = os.path.exists(os.path.expanduser('~/.codex/auth.json'))
     os.environ['CODEX_ENABLED'] = '1' if shutil.which('codex') and signed_in else '0'
 if os.environ.get('OPENCODE_ENABLED', '1') == '1':
-    children.append(subprocess.Popen(['opencode', 'serve', '--hostname', '127.0.0.1', '--port', '7777'],
-                                     cwd=workspace))
+    # Recording tests of this exact image/entrypoint must never start a real backend.
+    command = ([sys.executable, str(BRIDGE / 'stub_opencode.py')]
+               if os.environ.get('AGENT_TEST_MODE') == '1' else
+               ['opencode', 'serve', '--hostname', '127.0.0.1', '--port', '7777'])
+    children.append(subprocess.Popen(command,
+                                     cwd=workspace, env=dict(os.environ, STUB_PORT='7777')))
     for _ in range(120):
         try:
             socket.create_connection(('127.0.0.1', 7777), timeout=1).close()

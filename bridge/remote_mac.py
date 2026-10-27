@@ -19,6 +19,7 @@ import uuid
 import zlib
 from vm_debug import VM_DEBUG, hexdump
 from mac_context import host_capabilities, guide_catalog, read_guide
+from mac_binary import TRANSPORT as BINARY_TRANSPORT
 
 CHUNK = 3072
 MAX_FILE = 16 * 1024 * 1024
@@ -39,6 +40,28 @@ class MacBroker:
         self.lock = threading.Lock()
         self.tool_lock = threading.Lock()
         self.pending = {}
+
+    def binary(self, session, connection, token, count, chunks):
+        """One frame, one connection, no replay even if the final reply is lost."""
+        if not session.alive or session.connection_id != connection:
+            raise MacError("The Macintosh disconnected; binary import was not continued")
+        nonce, answer = uuid.uuid4().hex, queue.Queue(maxsize=1)
+        with self.lock:
+            self.pending[nonce] = (session, connection, answer)
+        try:
+            session.send_binary(connection, token, nonce, count, chunks)
+            try: result = answer.get(timeout=30)
+            except queue.Empty: raise MacError("Binary fork reply timed out; no bytes were repeated")
+            if result.get("received") != count or "mac_error" in result:
+                raise MacError("Macintosh did not acknowledge the complete binary fork")
+            return result
+        except Exception:
+            # A partial body can contain arbitrary command-looking bytes. End
+            # the connection before any cancel/control line can be written.
+            session.abort_binary(connection)
+            raise
+        finally:
+            with self.lock: self.pending.pop(nonce, None)
 
     def request(self, session, connection, op, path="", offset=0, count=0, data=b"", fork="data", create_only=False, expected_crc="-"):
         if op not in {"state", "system", "system_items", "system_probe", "registry_probe", "idle_metrics", "hardware", "application_command", "volumes", "list", "stat", "read", "write_begin", "write_stream_begin", "write_chunk", "write_commit", "write_cancel", "mkdir", "rename", "delete", "processes", "process_info", "process_read", "windows", "events", "screen_begin", "screen_read", "screen_end", "focus", "launch", "client", "palette", "set_info", "restore_info", "open"}:
@@ -65,7 +88,10 @@ class MacBroker:
             fields = [nonce, op, base64.b64encode(encoded).decode(), str(offset), str(count),
                       base64.b64encode(data).decode(), fork, "1" if create_only else "0", expected_crc]
             session.send("C:RPC\t" + "\t".join(fields))
-            try: result = answer.get(timeout=20 if op == "application_command" else 15)
+            # Preserving the other fork of a large application can scan/copy
+            # up to 64 MiB during begin/commit, without any upload traffic.
+            timeout = 120 if op in {"write_stream_begin", "write_commit"} else 20 if op == "application_command" else 15
+            try: result = answer.get(timeout=timeout)
             except queue.Empty: raise MacError("Macintosh tool timed out; no request was repeated.")
             if "mac_error" in result:
                 codes = {-43: "File not found", -48: "Name already exists", -54: "Permission denied or locked",
@@ -172,7 +198,7 @@ ARCHIVE_SOURCE = {"url": {"type": "string"}, "host_path": {"type": "string"}, "e
 tool("inspect_archive", "Read a host/downloaded Classic Mac archive inventory without extraction or guest writes. Reports format, SHA-256, exact paths, logical entry count, both fork sizes, Finder codes and import issues. Installed lsar recognizes BinHex, StuffIt, MacBinary and supported ZIPs, including nested formats; do not invent a decoder before inspection. Resource-only APPL files are normal. Optional paths select exact file names or folder subtrees; pagination follows next_start.",
      {**ARCHIVE_SOURCE, "start": {"type": "integer", "minimum": 0, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 64, "default": 32}})
 TOOLS[-1]["annotations"]["openWorldHint"] = True
-tool("import_archive", "Download or read an original host archive and import it into a NEW Macintosh HFS folder through the native File Manager, preserving both forks and Finder metadata. Inspect first; pass optional paths to select exact archive files (both forks) or folder subtrees while retaining relative paths. Installed unar handles StuffIt, BinHex and MacBinary. Maximum 16 MiB archive, 4 MiB selected forks, 128 logical HFS files/folders. Handles legitimate .rsrc filenames. Requires unar/lsar; no mounted disk or model binary payload.",
+tool("import_archive", "Download or read an original host archive and import it into a NEW Macintosh HFS folder through the native File Manager, preserving both forks and Finder metadata. Inspect first; pass optional paths to select exact archive files (both forks) or folder subtrees while retaining relative paths. Installed unar handles StuffIt, BinHex and MacBinary. Maximum 64 MiB archive and 64 MiB total selected forks, 128 logical HFS files/folders. Forks stream from temporary host files with bounded memory. Handles legitimate .rsrc filenames. Requires unar/lsar; no mounted disk or model binary payload.",
      {**ARCHIVE_SOURCE, "destination": PATH}, ("destination",), False)
 TOOLS[-1]["annotations"]["openWorldHint"] = True
 
@@ -366,31 +392,46 @@ class MacTools:
             source.seek(0)
             destination, fork = args["destination"], args.get("fork", "data")
             crc_hex = "%08x" % crc
-            token = self.rpc("write_stream_begin", path=destination, count=total, fork=fork,
-                             create_only=args.get("create_only", True), expected_crc=crc_hex)["token"]
-            try:
-                uploaded, uploaded_crc, uploaded_hash = 0, 0, hashlib.sha256()
+            committed, transport = self._import_fork(source, total, checksum, crc_hex, destination, fork,
+                args.get("create_only", True), lambda: identity(os.fstat(source.fileno())) == identity(original))
+        return {"path": destination, "fork": fork, "written": total, "sha256": checksum, "crc32": crc_hex,
+                "transport": transport, "cleanup_warning": committed.get("cleanup_warning", False)}
+
+    def _import_fork(self, source, total, checksum, crc_hex, destination, fork, create_only, unchanged=None):
+        begin = self.rpc("write_stream_begin", path=destination, count=total, fork=fork,
+                         data=BINARY_TRANSPORT.encode() if callable(getattr(self.session, "send_binary", None)) else b"",
+                         create_only=create_only, expected_crc=crc_hex)
+        token = begin["token"]
+        try:
+            uploaded, uploaded_crc, uploaded_hash = 0, 0, hashlib.sha256()
+            binary = begin.get("transport") == BINARY_TRANSPORT
+            def chunks():
+                nonlocal uploaded, uploaded_crc
                 while uploaded < total:
-                    raw = source.read(min(CHUNK, total-uploaded))
+                    raw = source.read(min(HOST_READ_CHUNK if binary else CHUNK, total-uploaded))
                     if not raw: raise MacError("Host source became shorter during import")
-                    response = self.rpc("write_chunk", path=token, offset=uploaded, data=raw)
                     uploaded += len(raw)
+                    uploaded_hash.update(raw); uploaded_crc = zlib.crc32(raw, uploaded_crc)
+                    yield raw
+            if binary and total:
+                self.broker.binary(self.session, self.connection, token, total, chunks())
+            else:
+                for raw in chunks():
+                    response = self.rpc("write_chunk", path=token, offset=uploaded-len(raw), data=raw)
                     if response.get("received") != uploaded:
                         raise MacError("Macintosh did not acknowledge the complete import chunk")
-                    uploaded_hash.update(raw); uploaded_crc = zlib.crc32(raw, uploaded_crc)
-                if (source.read(1) or uploaded_hash.hexdigest() != checksum or uploaded_crc != crc or
-                        identity(os.fstat(source.fileno())) != identity(original)):
-                    raise MacError("Host source changed during import; staged data was cancelled")
-                committed = self.rpc("write_commit", path=token)
-                if (committed.get("committed") is not True or committed.get("written") != total or
-                        committed.get("crc32") != crc_hex):
-                    raise MacError("Macintosh did not verify the imported fork's size and CRC")
-            except Exception:
-                try: self.rpc("write_cancel", path=token)
-                except Exception: pass
-                raise
-        return {"path": destination, "fork": fork, "written": total, "sha256": checksum, "crc32": crc_hex,
-                "cleanup_warning": committed.get("cleanup_warning", False)}
+            if (source.read(1) or uploaded_hash.hexdigest() != checksum or "%08x" % uploaded_crc != crc_hex or
+                    (unchanged is not None and not unchanged())):
+                raise MacError("Host source changed during import; staged data was cancelled")
+            committed = self.rpc("write_commit", path=token)
+            if (committed.get("committed") is not True or committed.get("written") != total or
+                    committed.get("crc32") != crc_hex):
+                raise MacError("Macintosh did not verify the imported fork's size and CRC")
+        except Exception:
+            try: self.rpc("write_cancel", path=token)
+            except Exception: pass
+            raise
+        return committed, BINARY_TRANSPORT if binary else "base64-3072"
 
     def screenshot(self):
         from PIL import Image

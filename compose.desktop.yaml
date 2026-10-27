@@ -1,0 +1,10 @@
+# Portable manual-address alternative, including Docker Desktop on macOS/Windows.
+# docker compose -f compose.yaml -f compose.desktop.yaml up -d
+services:
+  relay:
+    network_mode: bridge
+    ports:
+      - "${AGENTCHAT_PORT:-8765}:8765/tcp"
+    environment:
+      CHAT_PORT: "8765"
+      AGENT_DISCOVERY: "0"

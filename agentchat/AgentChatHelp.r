@@ -129,7 +129,7 @@ resource 'hdlg' (133, "Find dialog help", purgeable) {
 };
 resource 'hdlg' (135, "Connection dialog help", purgeable) {
     HelpMgrVersion, 0, hmDefaultOptions, 0, 0, HMSkipItem {}, {
-        DIALOG_HELP("IPv4 address of the computer running the AgentChat bridge, for example 192.168.1.171. Enter four numbers from 0 to 255 separated by periods.");
+        DIALOG_HELP("IPv4 address of the relay computer. Leave blank to find a relay on your local network. A saved address is always tried before automatic discovery.");
         DIALOG_HELP("Save these settings in the Macintosh Preferences folder and connect to this bridge.\r\rReturn also chooses Connect.");
         DIALOG_HELP("Close this dialog without changing the saved settings.\r\rEscape also cancels.");
         DIALOG_HELP("The network address of your bridge computer. Enter an IPv4 address in the field beside this label.");
@@ -141,8 +141,10 @@ resource 'hdlg' (135, "Connection dialog help", purgeable) {
         DIALOG_HELP("Explains any invalid address or port. Correct the indicated field before connecting.");
         DIALOG_HELP("Fill in this build's default address, ports, and startup setting. Choose Connect to save them, or Cancel to keep your current settings.");
         DIALOG_HELP("Address and ports of the computer running your bridge. Enter an IPv4 address and the matching service ports.");
-        DIALOG_HELP("Choose whether AgentChat connects automatically when it starts.");
+        DIALOG_HELP("Automatic connection and local network discovery settings.");
         DIALOG_HELP("Choose which models from connected providers appear in the sidebar.");
+        DIALOG_HELP("Find a relay on the local network when no address is set or the saved address fails. Turn this off to use only your typed address and send no discovery packets.");
+        DIALOG_HELP("Search the local network now, then connect and save the first responding relay that accepts a connection. Requires discovery to be enabled. This closes Connection Settings.");
     }
 };
 

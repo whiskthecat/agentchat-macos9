@@ -1,17 +1,20 @@
 # AgentChat relay. Start it with:   docker compose up -d
-# Then point AgentChat (File > Connection Settings) at this computer's IP, port 8765.
+# Linux: launch AgentChat on the same LAN; it finds this relay automatically.
+# Docker Desktop: use compose.desktop.yaml and enter the host IP (README.md).
 services:
   relay:
     build: .
     image: agentchat-relay
     restart: unless-stopped
-    ports:
-      - "8765:8765"
+    network_mode: host  # receive LAN broadcasts; UDP port publishing is insufficient
     volumes:
       - agentchat-data:/data    # sign-ins, conversation history, the agent's workspace
     environment:
       # Optional: the model new conversations start with, as provider/model (see the model list).
       # By default the relay picks a free OpenCode model, which needs no sign-in.
       AGENT_MODEL: ""
+      CHAT_PORT: "${AGENTCHAT_PORT:-8765}"
+      DISCOVERY_PORT: "8765"
+      AGENT_DISCOVERY: "${AGENT_DISCOVERY:-1}" # set 0 to disable the UDP responder
 volumes:
   agentchat-data:

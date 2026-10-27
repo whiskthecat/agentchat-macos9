@@ -52,7 +52,7 @@ static const char k64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 static struct { UInt32 ticks; char kind[20], detail[100]; } gEvents[64];
 static unsigned long gEventSeq;
 static struct {
-    Boolean active, existed, resource, stream;
+    Boolean active, existed, resource, stream, binary;
     FSSpec target, temp;
     SInt16 fd;
     long received, size, oldData, oldResource, limit;
@@ -60,12 +60,19 @@ static struct {
     UInt32 dataCRC, resourceCRC, writtenCRC, expectedWrittenCRC;
     char token[48];
 } gWrite;
+static struct {
+    Ptr buffer;
+    long remaining;
+    Boolean failed;
+    char nonce[41];
+} gBinary;
 static GWorldPtr gScreen;
 static Handle gScreenPacked;
 static long gScreenPackedBytes;
 static UInt32 gScreenUsed;
 static unsigned long gScreenToken;
 static unsigned long gSerial;
+static UInt32 gLastOperation;
 
 static void add(const char *s) {
     long n = strlen(s);
@@ -332,28 +339,50 @@ static OSErr read_file(const char *path, long offset, long count, Boolean resour
     add(",\"eof\":"); add(offset + n >= size ? "true" : "false"); add("}"); return noErr;
 }
 static void cancel_write(void) {
+    if (gBinary.buffer) DisposePtr(gBinary.buffer);
+    memset(&gBinary, 0, sizeof gBinary);
     if (!gWrite.active) return;
     if (gWrite.fd) FSClose(gWrite.fd);
     FSpDelete(&gWrite.temp); memset(&gWrite, 0, sizeof gWrite);
 }
+/* Long preservation scans/copies also cooperate, without receiving commands
+ * or consuming key/mouse events while a File Manager transaction is active. */
+static void file_yield(UInt32 *last) {
+    UInt32 now = TickCount(); EventRecord event;
+    if ((UInt32)(now - *last) < 2u) return;
+    WaitNextEvent(updateMask | activMask | osMask, &event, 0, NULL);
+    if (gApplicationIdle) gApplicationIdle(&event, gApplicationIdleContext);
+    *last = TickCount();
+}
 static OSErr copy_fork(const FSSpec *from, const FSSpec *to, Boolean resource, long limit) {
-    SInt16 a, b; OSErr err, closed; long total = 0; char buf[CHUNK];
-    err = resource ? FSpOpenRF(from, fsRdPerm, &a) : FSpOpenDF(from, fsRdPerm, &a); if (err) return err;
+    SInt16 a, b; OSErr err, closed; long total = 0; Ptr buf = NewPtr(65536L); UInt32 yielded = TickCount();
+    if (!buf) return memFullErr;
+    err = resource ? FSpOpenRF(from, fsRdPerm, &a) : FSpOpenDF(from, fsRdPerm, &a);
+    if (err) { DisposePtr(buf); return err; }
     err = resource ? FSpOpenRF(to, fsWrPerm, &b) : FSpOpenDF(to, fsWrPerm, &b);
-    if (err) { FSClose(a); return err; }
+    if (err) { FSClose(a); DisposePtr(buf); return err; }
     while (1) {
-        long n = CHUNK, written; err = FSRead(a, &n, buf);
+        long n = 65536L, written; err = FSRead(a, &n, buf);
         if (err && err != eofErr) break;
         if (n > limit - total) { err = paramErr; break; }
         written = n; if (n) { OSErr w = FSWrite(b, &written, buf); if (w || written != n) { err = w ? w : dskFulErr; break; } }
         total += n; if (err == eofErr || !n) { err = noErr; break; }
-        SystemTask();
+        file_yield(&yielded);
     }
-    closed = FSClose(b); FSClose(a); if (!err) err = closed; return err;
+    closed = FSClose(b); FSClose(a); DisposePtr(buf); if (!err) err = closed; return err;
 }
 static UInt32 crc_update(UInt32 crc, const unsigned char *data, long n) {
+    static UInt32 table[256]; static Boolean ready = FALSE;
     long i; short bit;
-    for (i = 0; i < n; i++) { crc ^= data[i]; for (bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320UL : 0); }
+    if (!ready) {
+        for (i = 0; i < 256; i++) {
+            UInt32 v = i;
+            for (bit = 0; bit < 8; bit++) v = (v >> 1) ^ ((v & 1) ? 0xEDB88320UL : 0);
+            table[i] = v;
+        }
+        ready = TRUE;
+    }
+    for (i = 0; i < n; i++) crc = (crc >> 8) ^ table[(crc ^ data[i]) & 255];
     return crc;
 }
 static Boolean crc_value(const char *text, UInt32 *value) {
@@ -369,18 +398,21 @@ static Boolean crc_value(const char *text, UInt32 *value) {
     *value = crc; return TRUE;
 }
 static OSErr fork_crc(const FSSpec *f, Boolean resource, UInt32 *value, long limit) {
-    SInt16 fd; OSErr err; unsigned char data[CHUNK]; long total = 0;
-    UInt32 crc = 0xFFFFFFFFUL;
-    err = resource ? FSpOpenRF(f, fsRdPerm, &fd) : FSpOpenDF(f, fsRdPerm, &fd); if (err) return err;
+    SInt16 fd; OSErr err, closed; Ptr data = NewPtr(65536L); long total = 0;
+    UInt32 crc = 0xFFFFFFFFUL, yielded = TickCount();
+    if (!data) return memFullErr;
+    err = resource ? FSpOpenRF(f, fsRdPerm, &fd) : FSpOpenDF(f, fsRdPerm, &fd);
+    if (err) { DisposePtr(data); return err; }
     while (1) {
-        long n = CHUNK; err = FSRead(fd, &n, data);
+        long n = 65536L; err = FSRead(fd, &n, data);
         if (err && err != eofErr) break;
         if (n > limit - total) { err = paramErr; break; }
-        total += n; crc = crc_update(crc, data, n);
+        total += n; crc = crc_update(crc, (const unsigned char *)data, n);
         if (err == eofErr || !n) { err = noErr; break; }
-        SystemTask();
+        file_yield(&yielded);
     }
-    FSClose(fd); *value = crc ^ 0xFFFFFFFFUL; return err;
+    closed = FSClose(fd); DisposePtr(data); if (!err) err = closed;
+    *value = crc ^ 0xFFFFFFFFUL; return err;
 }
 static OSErr begin_write(const char *path, long size, Boolean resource, Boolean createOnly, const char *expected, Boolean stream) {
     OSErr err; FInfo finder; CInfoPBRec pb; char name[32]; UInt32 expectedCRC = 0;
@@ -433,6 +465,50 @@ static OSErr write_chunk(const char *token, long offset, const char *data) {
     if (gWrite.stream) gWrite.writtenCRC = crc_update(gWrite.writtenCRC, bytes, n);
     gWrite.received += n; gWrite.used = TickCount();
     add("{\"received\":"); number(gWrite.received); add("}"); return noErr;
+}
+/* Header and body belong to this connection's owned stage. Do not recover
+ * line mode from a rejected header, failed write, timeout or disconnect. */
+OSErr RemoteMacBinaryBegin(char *header) {
+    char *token, *count, *nonce, *end; long size; short i;
+    if (strncmp(header, "B:raw-fork-v1\t", 14)) return paramErr;
+    token = header + 14;
+    count = strchr(token, '\t'); if (!count) return paramErr; *count++ = 0;
+    nonce = strchr(count, '\t'); if (!nonce) return paramErr; *nonce++ = 0;
+    end = strchr(nonce, '\t'); if (end) return paramErr;
+    if (strlen(nonce) != 32) return paramErr;
+    for (i = 0; i < 32; i++) if (!((nonce[i] >= '0' && nonce[i] <= '9') || (nonce[i] >= 'a' && nonce[i] <= 'f'))) return paramErr;
+    if (!integer(count, &size) || size <= 0 || size > MAX_STREAM_FILE ||
+        !gWrite.active || !gWrite.stream || !gWrite.binary || gWrite.received ||
+        size != gWrite.size || strcmp(token, gWrite.token) || gBinary.remaining) return paramErr;
+    gBinary.buffer = NewPtr(65536L);
+    if (!gBinary.buffer) return memFullErr;
+    gBinary.remaining = size; strcpy(gBinary.nonce, nonce);
+    gWrite.used = TickCount();
+    return noErr;
+}
+long RemoteMacBinaryRemaining(void) { return gBinary.remaining; }
+char *RemoteMacBinaryBuffer(void) { return gBinary.buffer; }
+Boolean RemoteMacBinaryFailed(void) { return gBinary.failed; }
+OSErr RemoteMacBinaryReceive(const char *bytes, long count) {
+    long written = count, n; OSErr err;
+    if (!gWrite.active || !gBinary.remaining || count <= 0 || count > gBinary.remaining || count > 65536L) return paramErr;
+    err = FSWrite(gWrite.fd, &written, bytes);
+    if (err || written != count) { cancel_write(); return err ? err : dskFulErr; }
+    gWrite.writtenCRC = crc_update(gWrite.writtenCRC, (const unsigned char *)bytes, count);
+    gWrite.received += count; gBinary.remaining -= count; gWrite.used = TickCount();
+    gLastOperation = gWrite.used | 1;
+    if (!gBinary.remaining) {
+        DisposePtr(gBinary.buffer); gBinary.buffer = NULL;
+        gHandling = TRUE;
+        gJN = 0; gJSON[0] = 0; gOverflow = FALSE;
+        add("{\"received\":"); number(gWrite.received); add("}");
+        sprintf(gWire, "E:%s\t0\t", gBinary.nonce);
+        n = strlen(gWire); n += encode((unsigned char *)gJSON, gJN, gWire + n); gWire[n++] = '\n';
+        gReplyBytes = n;
+        if (gSend && gSend(gWire, n)) gReplyBytes = 0;
+        gHandling = FALSE;
+    }
+    return noErr;
 }
 static OSErr commit_write(const char *token) {
     OSErr err; CInfoPBRec pb; FSSpec target = gWrite.target; UInt32 crc, writtenCRC;
@@ -747,7 +823,9 @@ void RemoteMacTick(void) {
         if (gSend(gWire, gReplyBytes)) gReplyBytes = 0;
         gHandling = FALSE;
     }
-    if (gWrite.active && TickCount() - gWrite.used > 60u * 60u) cancel_write();
+    if (gBinary.remaining && (UInt32)(TickCount() - gWrite.used) >= 15u * 60u) {
+        cancel_write(); gBinary.failed = TRUE;
+    } else if (gWrite.active && TickCount() - gWrite.used > 60u * 60u) cancel_write();
     if (gScreen && TickCount() - gScreenUsed > 60u * 60u) release_screen();
 }
 static OSErr set_file_info(const char *path, long flags, Boolean hasFlags, const char *encoded) {
@@ -792,7 +870,7 @@ static OSErr open_document(const char *path) {
 
 /* A host stream of small operations (a file import is thousands of 3 KB
  * chunks) must not wait out the event loop's idle sleep between each one. */
-static UInt32 gLastOperation;
+
 Boolean RemoteMacBusy(void) { return gLastOperation && TickCount() - gLastOperation < 30u; }
 
 Boolean RemoteMacHandle(char *command) {
@@ -826,6 +904,12 @@ Boolean RemoteMacHandle(char *command) {
         else if (!strcmp(f[1], "write_stream_begin")) {
             if ((strcmp(f[6], "data") && strcmp(f[6], "resource")) || (strcmp(f[7], "0") && strcmp(f[7], "1"))) err = paramErr;
             else err = begin_write(path, count, !strcmp(f[6], "resource"), !strcmp(f[7], "1"), f[8], TRUE);
+            /* Old relays send an empty data field; old clients ignore the
+             * offer and return only a token. Never infer support by version. */
+            if (!err && !strcmp(f[5], "cmF3LWZvcmstdjE=")) {
+                gWrite.binary = TRUE; gJSON[--gJN] = 0;
+                add(",\"transport\":\"raw-fork-v1\"}");
+            }
         }
         else if (!strcmp(f[1], "write_chunk")) err = write_chunk(path, offset, f[5]);
         else if (!strcmp(f[1], "write_commit")) err = commit_write(path);
