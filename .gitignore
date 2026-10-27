@@ -1,0 +1,5 @@
+__pycache__/
+agentchat/build*/
+*.sqlite3
+bridge/shots/
+/build/

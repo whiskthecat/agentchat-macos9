@@ -1,0 +1,17 @@
+# AgentChat relay. Start it with:   docker compose up -d
+# Then point AgentChat (File > Connection Settings) at this computer's IP, port 8765.
+services:
+  relay:
+    build: .
+    image: agentchat-relay
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - agentchat-data:/data    # sign-ins, conversation history, the agent's workspace
+    environment:
+      # Optional: the model new conversations start with, as provider/model (see the model list).
+      # By default the relay picks a free OpenCode model, which needs no sign-in.
+      AGENT_MODEL: ""
+volumes:
+  agentchat-data:
